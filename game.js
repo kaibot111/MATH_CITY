@@ -1,17 +1,19 @@
 // --- Game Constants ---
-const SPEED = 0.8;
-const TURN_SPEED = 0.05;
+// We use "Units Per Second" now instead of "Units Per Frame" for smoothness
+const MOVEMENT_SPEED = 50.0; 
+const ROTATION_SPEED = 3.0; 
+const LERP_FACTOR = 10.0; // How fast remote cars smooth to their target (Higher = snappier, Lower = smoother)
 
 // --- Init Three.js ---
 const scene = new THREE.Scene();
+const clock = new THREE.Clock(); // Tracks time between frames
 
 // --- 1. FIXED SKY SPHERE ---
-// We use a giant sphere with the image on the *inside*
 const loader = new THREE.TextureLoader();
 const skyGeo = new THREE.SphereGeometry(1500, 32, 32);
 const skyMat = new THREE.MeshBasicMaterial({ 
-    map: loader.load('sky.jpg'), // Make sure 'sky.jpg' exists!
-    side: THREE.BackSide // Draw texture on the inside of the sphere
+    map: loader.load('sky.jpg'), 
+    side: THREE.BackSide 
 });
 const skySphere = new THREE.Mesh(skyGeo, skyMat);
 scene.add(skySphere);
@@ -40,11 +42,14 @@ scene.add(ground);
 // --- Networking Setup ---
 const socket = io();
 const infoDiv = document.getElementById('info');
-let otherPlayers = {};
+
+// We now store state objects: { mesh: THREE.Group, targetX: number, targetZ: number, targetRot: number }
+let otherPlayers = {}; 
 let aiCarMeshes = {}; 
+
 let myCar;
 let myId;
-let walls = []; // Collidable objects (buildings + fence)
+let walls = []; 
 
 // --- Helper: Build a Polygon Car ---
 function createPolyCar(colorHex, isAI = false) {
@@ -88,14 +93,11 @@ function createPolyCar(colorHex, isAI = false) {
 }
 
 // --- CITY & ROAD GENERATION ---
-
-// 2. URBAN FENCE GENERATOR
 function createFence(rows, cols, blockSize) {
     const totalWidth = rows * blockSize;
     const totalDepth = cols * blockSize;
     const fenceHeight = 15;
     
-    // Wireframe material to look like a chain-link fence
     const fenceMat = new THREE.MeshBasicMaterial({ 
         color: 0x555555, 
         wireframe: true,
@@ -107,10 +109,10 @@ function createFence(rows, cols, blockSize) {
     const halfD = totalDepth / 2;
 
     const fenceConfigs = [
-        { w: totalWidth, d: 1, x: 0, z: -halfD }, // North Wall
-        { w: totalWidth, d: 1, x: 0, z: halfD },  // South Wall
-        { w: 1, d: totalDepth, x: -halfW, z: 0 }, // West Wall
-        { w: 1, d: totalDepth, x: halfW, z: 0 }   // East Wall
+        { w: totalWidth, d: 1, x: 0, z: -halfD }, 
+        { w: totalWidth, d: 1, x: 0, z: halfD },  
+        { w: 1, d: totalDepth, x: -halfW, z: 0 }, 
+        { w: 1, d: totalDepth, x: halfW, z: 0 }   
     ];
 
     fenceConfigs.forEach(cfg => {
@@ -192,19 +194,32 @@ socket.on('cityMap', (data) => {
 
 socket.on('updateAI', (aiData) => {
     aiData.forEach(ai => {
+        // If this is a new AI car, create it
         if (!aiCarMeshes[ai.id]) {
             const car = createPolyCar(0x00FF00, true); 
+            // Start at the correct position immediately
+            car.position.set(ai.x, 0, ai.z);
             scene.add(car);
-            aiCarMeshes[ai.id] = car;
+            
+            // Store the mesh AND the target coordinates
+            aiCarMeshes[ai.id] = { 
+                mesh: car, 
+                targetX: ai.x, 
+                targetZ: ai.z, 
+                targetRot: 0 // Will determine below
+            };
         }
 
-        const mesh = aiCarMeshes[ai.id];
-        mesh.position.set(ai.x, 0, ai.z);
+        // Update the TARGET position, do not move mesh yet (we smooth it in animate)
+        const aiObj = aiCarMeshes[ai.id];
+        aiObj.targetX = ai.x;
+        aiObj.targetZ = ai.z;
         
-        if (ai.dir === 1) mesh.rotation.y = Math.PI / 2;
-        if (ai.dir === -1) mesh.rotation.y = -Math.PI / 2;
-        if (ai.dir === 2) mesh.rotation.y = 0;
-        if (ai.dir === -2) mesh.rotation.y = Math.PI;
+        // Determine rotation based on direction
+        if (ai.dir === 1) aiObj.targetRot = Math.PI / 2;
+        if (ai.dir === -1) aiObj.targetRot = -Math.PI / 2;
+        if (ai.dir === 2) aiObj.targetRot = 0;
+        if (ai.dir === -2) aiObj.targetRot = Math.PI;
     });
 });
 
@@ -223,7 +238,14 @@ socket.on('currentPlayers', (serverPlayers) => {
             opCar.position.set(p.x, 0, p.z);
             opCar.rotation.y = p.rot;
             scene.add(opCar);
-            otherPlayers[id] = opCar;
+            
+            // Store as object for interpolation
+            otherPlayers[id] = {
+                mesh: opCar,
+                targetX: p.x,
+                targetZ: p.z,
+                targetRot: p.rot
+            };
         }
     });
 });
@@ -233,20 +255,27 @@ socket.on('newPlayer', (data) => {
     opCar.position.set(data.player.x, 0, data.player.z);
     opCar.rotation.y = data.player.rot;
     scene.add(opCar);
-    otherPlayers[data.id] = opCar;
+    
+    otherPlayers[data.id] = {
+        mesh: opCar,
+        targetX: data.player.x,
+        targetZ: data.player.z,
+        targetRot: data.player.rot
+    };
 });
 
 socket.on('playerMoved', (data) => {
     if (otherPlayers[data.id]) {
-        otherPlayers[data.id].position.x = data.x;
-        otherPlayers[data.id].position.z = data.z;
-        otherPlayers[data.id].rotation.y = data.rot;
+        // Just update the target, don't teleport!
+        otherPlayers[data.id].targetX = data.x;
+        otherPlayers[data.id].targetZ = data.z;
+        otherPlayers[data.id].targetRot = data.rot;
     }
 });
 
 socket.on('playerDisconnected', (id) => {
     if (otherPlayers[id]) {
-        scene.remove(otherPlayers[id]);
+        scene.remove(otherPlayers[id].mesh); // Remove the mesh from scene
         delete otherPlayers[id];
     }
 });
@@ -268,40 +297,34 @@ window.addEventListener('keyup', (e) => {
     if (e.key === 'd' || e.key === 'ArrowRight') keys.d = false;
 });
 
-// --- Physics Check (UPDATED) ---
-
-// Pre-allocate Box3 objects to avoid garbage collection lag
+// --- Physics Check ---
 const tempCarBox = new THREE.Box3();
 const tempObstacleBox = new THREE.Box3();
 
 function checkCollision(x, z) {
-    // 1. Create a hypothetical box for where the player wants to go
     tempCarBox.setFromCenterAndSize(
         new THREE.Vector3(x, 1, z),
-        new THREE.Vector3(2.2, 2, 4.5) // Player Car Size
+        new THREE.Vector3(2.2, 2, 4.5) 
     );
 
-    // 2. Check Static Walls (Buildings + Fence)
+    // Walls
     for (let wall of walls) {
         tempObstacleBox.setFromObject(wall);
         if (tempCarBox.intersectsBox(tempObstacleBox)) return true;
     }
 
-    // 3. Check AI Cars
+    // AI Cars (Access the .mesh property now)
     for (const id in aiCarMeshes) {
-        const aiCar = aiCarMeshes[id];
-        // We use setFromObject because AI cars are scaled x3
+        const aiCar = aiCarMeshes[id].mesh; 
         tempObstacleBox.setFromObject(aiCar);
-        // Shrink hitbox slightly for gameplay forgiveness
         tempObstacleBox.expandByScalar(-1.0); 
         if (tempCarBox.intersectsBox(tempObstacleBox)) return true;
     }
 
-    // 4. Check Other Players
+    // Other Players (Access the .mesh property now)
     for (const id in otherPlayers) {
-        const otherCar = otherPlayers[id];
+        const otherCar = otherPlayers[id].mesh;
         tempObstacleBox.setFromObject(otherCar);
-        // Shrink hitbox slightly
         tempObstacleBox.expandByScalar(-0.5); 
         if (tempCarBox.intersectsBox(tempObstacleBox)) return true;
     }
@@ -313,52 +336,86 @@ function checkCollision(x, z) {
 function animate() {
     requestAnimationFrame(animate);
 
+    // 1. Get the time passed since last frame (in seconds)
+    // This ensures consistency across 30fps, 60fps, 144fps
+    const delta = clock.getDelta(); 
+
     if (myCar) {
-        let move = 0;
-        let turn = 0;
+        let moveDist = 0;
+        let turnAngle = 0;
 
-        if (keys.w) move = SPEED;
-        if (keys.s) move = -SPEED;
-        if (keys.a) turn = TURN_SPEED;
-        if (keys.d) turn = -TURN_SPEED;
+        // Apply Delta Time to movement
+        if (keys.w) moveDist = MOVEMENT_SPEED * delta;
+        if (keys.s) moveDist = -MOVEMENT_SPEED * delta;
+        if (keys.a) turnAngle = ROTATION_SPEED * delta;
+        if (keys.d) turnAngle = -ROTATION_SPEED * delta;
 
-        myCar.rotation.y += turn;
+        myCar.rotation.y += turnAngle;
 
-        const dx = Math.sin(myCar.rotation.y) * move;
-        const dz = Math.cos(myCar.rotation.y) * move;
+        const dx = Math.sin(myCar.rotation.y) * moveDist;
+        const dz = Math.cos(myCar.rotation.y) * moveDist;
 
         const nextX = myCar.position.x + dx;
         const nextZ = myCar.position.z + dz;
 
-        // If no collision, move freely
         if (!checkCollision(nextX, nextZ)) {
             myCar.position.x = nextX;
             myCar.position.z = nextZ;
         } else {
-            // Collision detected! "Bounce" back slightly.
-            // This prevents sticking to walls/cars.
+            // "Bounce" logic
             myCar.position.x -= dx * 0.5;
             myCar.position.z -= dz * 0.5;
         }
 
-        // Camera Logic
+        // Smooth Camera Logic (Time-based Lerp)
         const camDist = 20; 
         const camHeight = 8;
         
         const targetX = myCar.position.x - Math.sin(myCar.rotation.y) * camDist;
         const targetZ = myCar.position.z - Math.cos(myCar.rotation.y) * camDist;
 
-        camera.position.x += (targetX - camera.position.x) * 0.1;
-        camera.position.z += (targetZ - camera.position.z) * 0.1;
+        // Using delta in lerp makes camera speed consistent
+        const smoothing = 5.0 * delta; 
+        camera.position.x += (targetX - camera.position.x) * smoothing;
+        camera.position.z += (targetZ - camera.position.z) * smoothing;
         camera.position.y = myCar.position.y + camHeight;
         camera.lookAt(myCar.position);
 
-        if (move !== 0 || turn !== 0) {
+        if (moveDist !== 0 || turnAngle !== 0) {
             socket.emit('playerMovement', {
                 x: myCar.position.x,
                 z: myCar.position.z,
                 rot: myCar.rotation.y
             });
+        }
+    }
+
+    // --- INTERPOLATION (Smoothing) FOR OTHERS ---
+    
+    // Smooth AI Cars
+    for (const id in aiCarMeshes) {
+        const obj = aiCarMeshes[id];
+        if (obj.mesh && obj.targetX !== undefined) {
+            // Linearly Interpolate (Lerp) positions
+            const lerpSpeed = LERP_FACTOR * delta;
+            obj.mesh.position.x += (obj.targetX - obj.mesh.position.x) * lerpSpeed;
+            obj.mesh.position.z += (obj.targetZ - obj.mesh.position.z) * lerpSpeed;
+            
+            // For rotation, we can snap or lerp. Snapping is cleaner for grid-AI.
+            obj.mesh.rotation.y = obj.targetRot;
+        }
+    }
+
+    // Smooth Other Players
+    for (const id in otherPlayers) {
+        const obj = otherPlayers[id];
+        if (obj.mesh && obj.targetX !== undefined) {
+            const lerpSpeed = LERP_FACTOR * delta;
+            obj.mesh.position.x += (obj.targetX - obj.mesh.position.x) * lerpSpeed;
+            obj.mesh.position.z += (obj.targetZ - obj.mesh.position.z) * lerpSpeed;
+            
+            // Simple rotation lerp
+            obj.mesh.rotation.y += (obj.targetRot - obj.mesh.rotation.y) * lerpSpeed;
         }
     }
 
