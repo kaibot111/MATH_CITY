@@ -114,14 +114,10 @@ function createFence(rows, cols, blockSize) {
     ];
 
     fenceConfigs.forEach(cfg => {
-        // Create Visual Mesh
-        // Segments (width/20) helps the wireframe look like a grid
         const geo = new THREE.BoxGeometry(cfg.w, fenceHeight, cfg.d, Math.floor(cfg.w/20), 2, Math.floor(cfg.d/20));
         const fence = new THREE.Mesh(geo, fenceMat);
         fence.position.set(cfg.x, fenceHeight/2, cfg.z);
         scene.add(fence);
-        
-        // Add to collision list
         walls.push(fence);
     });
 }
@@ -187,7 +183,7 @@ socket.on('cityMap', (data) => {
     walls.length = 0;
 
     createRoads(data.rows, data.cols, data.blockSize);
-    createFence(data.rows, data.cols, data.blockSize); // Build the Fence
+    createFence(data.rows, data.cols, data.blockSize); 
 
     data.layout.forEach(buildingData => {
         createBuilding(buildingData);
@@ -272,17 +268,44 @@ window.addEventListener('keyup', (e) => {
     if (e.key === 'd' || e.key === 'ArrowRight') keys.d = false;
 });
 
-// --- Physics Check ---
+// --- Physics Check (UPDATED) ---
+
+// Pre-allocate Box3 objects to avoid garbage collection lag
+const tempCarBox = new THREE.Box3();
+const tempObstacleBox = new THREE.Box3();
+
 function checkCollision(x, z) {
-    const carBox = new THREE.Box3().setFromCenterAndSize(
+    // 1. Create a hypothetical box for where the player wants to go
+    tempCarBox.setFromCenterAndSize(
         new THREE.Vector3(x, 1, z),
-        new THREE.Vector3(2.2, 2, 4.5)
+        new THREE.Vector3(2.2, 2, 4.5) // Player Car Size
     );
 
+    // 2. Check Static Walls (Buildings + Fence)
     for (let wall of walls) {
-        const wallBox = new THREE.Box3().setFromObject(wall);
-        if (carBox.intersectsBox(wallBox)) return true;
+        tempObstacleBox.setFromObject(wall);
+        if (tempCarBox.intersectsBox(tempObstacleBox)) return true;
     }
+
+    // 3. Check AI Cars
+    for (const id in aiCarMeshes) {
+        const aiCar = aiCarMeshes[id];
+        // We use setFromObject because AI cars are scaled x3
+        tempObstacleBox.setFromObject(aiCar);
+        // Shrink hitbox slightly for gameplay forgiveness
+        tempObstacleBox.expandByScalar(-1.0); 
+        if (tempCarBox.intersectsBox(tempObstacleBox)) return true;
+    }
+
+    // 4. Check Other Players
+    for (const id in otherPlayers) {
+        const otherCar = otherPlayers[id];
+        tempObstacleBox.setFromObject(otherCar);
+        // Shrink hitbox slightly
+        tempObstacleBox.expandByScalar(-0.5); 
+        if (tempCarBox.intersectsBox(tempObstacleBox)) return true;
+    }
+
     return false;
 }
 
@@ -307,10 +330,13 @@ function animate() {
         const nextX = myCar.position.x + dx;
         const nextZ = myCar.position.z + dz;
 
+        // If no collision, move freely
         if (!checkCollision(nextX, nextZ)) {
             myCar.position.x = nextX;
             myCar.position.z = nextZ;
         } else {
+            // Collision detected! "Bounce" back slightly.
+            // This prevents sticking to walls/cars.
             myCar.position.x -= dx * 0.5;
             myCar.position.z -= dz * 0.5;
         }
